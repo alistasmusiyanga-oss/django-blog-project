@@ -46,3 +46,4 @@ sudo docker compose exec web python manage.py shell
 
 # View running containers
 sudo docker ps
+# django-blog-project
