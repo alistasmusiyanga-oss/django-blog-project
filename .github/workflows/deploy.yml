@@ -1,44 +1,146 @@
-- name: Deploy to EC2
-  env:
-    PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-    HOST: 44.202.185.227
-    USER: ubuntu
-    ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-    IMAGE_TAG: ${{ github.sha }}
-  run: |
-    echo "Deploying to EC2 instance at: $HOST"
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: django-blog-project
+  CONTAINER_NAME: django-blog-app
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
     
-    # Save private key
-    echo "$PRIVATE_KEY" > private_key
-    chmod 600 private_key
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
     
-    # Deploy commands
-    ssh -o StrictHostKeyChecking=no -i private_key ${USER}@${HOST} "
-      set -e
-      
-      # Update system
-      sudo apt update -y
-      
-      # Install Docker if not installed
-      if ! command -v docker &> /dev/null; then
-        echo 'Installing Docker...'
-        sudo apt install docker.io -y
-        sudo systemctl start docker
-        sudo systemctl enable docker
-        sudo usermod -aG docker ubuntu
-        newgrp docker
-      fi
-      
-      # Install AWS CLI if not installed (using pip method)
-      if ! command -v aws &> /dev/null; then
-        echo 'Installing AWS CLI...'
-        sudo apt install python3 python3-pip -y
-        pip3 install awscli --upgrade --user
-        export PATH=\"\$HOME/.local/bin:\$PATH\"
-      fi
-      
-      echo 'Logging into ECR...'
-      aws ecr get-login-password --region us-east-1 | sudo docker login --username AWS --password-stdin $ECR_REGISTRY
-      
-      # Rest of your deployment commands...
-    "
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+      with:
+        mask-password: 'true'
+    
+    - name: Build, tag, and push image to Amazon ECR
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        # Build the Docker image
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:latest $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        
+        # Push the image
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        
+        # Save the image URI for later steps
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+    
+    - name: Deploy to EC2
+      env:
+        PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+        HOST: 44.202.185.227
+        USER: ubuntu
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+        IMAGE_TAG: ${{ github.sha }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      run: |
+        echo "🚀 Deploying to EC2 instance at: $HOST"
+        echo "📦 ECR Repository: $ECR_REPOSITORY"
+        echo "🏷️ Image Tag: $IMAGE_TAG"
+        
+        # Save private key with proper formatting
+        echo "$PRIVATE_KEY" > private_key
+        chmod 600 private_key
+        
+        # Deploy commands
+        ssh -o StrictHostKeyChecking=no -i private_key ${USER}@${HOST} "
+          set -e # Exit on any error
+          
+          # Update system packages
+          echo '🔄 Updating system packages...'
+          sudo apt update -y
+          
+          # Install Docker if not installed
+          if ! command -v docker &> /dev/null; then
+            echo '🐳 Installing Docker...'
+            sudo apt install docker.io -y
+            sudo systemctl start docker
+            sudo systemctl enable docker
+            sudo usermod -aG docker ubuntu
+            newgrp docker
+          fi
+          
+          # Install AWS CLI if not installed (using pip method)
+          if ! command -v aws &> /dev/null; then
+            echo '☁️ Installing AWS CLI...'
+            sudo apt install python3 python3-pip -y
+            pip3 install awscli --upgrade --user
+            export PATH=\"\$HOME/.local/bin:\$PATH\"
+          fi
+          
+          # Login to ECR
+          echo '🔐 Logging into ECR...'
+          aws ecr get-login-password --region us-east-1 | sudo docker login --username AWS --password-stdin $ECR_REGISTRY
+          
+          # Check for and stop existing container
+          echo '🔍 Checking for existing container...'
+          if [ \"\$(sudo docker ps -aq -f name=$CONTAINER_NAME)\" ]; then
+            echo '⏹️ Stopping and removing existing container...'
+            sudo docker stop $CONTAINER_NAME || true
+            sudo docker rm $CONTAINER_NAME || true
+          fi
+          
+          # Clean up old images
+          echo '🧹 Cleaning up old Docker images...'
+          sudo docker image prune -f || true
+          
+          # Pull the new image
+          echo '⬇️ Pulling new Docker image...'
+          sudo docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          
+          # Run the new container
+          echo '🚀 Starting new container...'
+          sudo docker run -d \
+            --name $CONTAINER_NAME \
+            --restart unless-stopped \
+            -p 80:8000 \
+            -p 8000:8000 \
+            -e AWS_ACCESS_KEY_ID=\"$AWS_ACCESS_KEY_ID\" \
+            -e AWS_SECRET_ACCESS_KEY=\"$AWS_SECRET_ACCESS_KEY\" \
+            -e DJANGO_SETTINGS_MODULE=\"blog_project.settings.production\" \
+            -e DEBUG=\"False\" \
+            $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          
+          # Wait for container to start
+          echo '⏳ Waiting for container to start...'
+          sleep 15
+          
+          # Run database migrations
+          echo '🔄 Running database migrations...'
+          sudo docker exec $CONTAINER_NAME python manage.py migrate --noinput
+          
+          # Collect static files (if needed)
+          echo '📦 Collecting static files...'
+          sudo docker exec $CONTAINER_NAME python manage.py collectstatic --noinput || echo 'Static collection failed, continuing...'
+          
+          # Check container status
+          echo '✅ Checking container status...'
+          sudo docker ps --filter \"name=$CONTAINER_NAME\" --format \"table {{.Names}}\\t{{.Status}}\\t{{.Ports}}\"
+          
+          echo '🎉 Deployment completed successfully!'
+          echo '🌐 Your app should be available at: http://$HOST'
+        "
